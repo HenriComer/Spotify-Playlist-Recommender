@@ -1,6 +1,6 @@
 """Spotify Playlist Recommender - Two-stage recommendation system using Item2Vec and LSTM."""
 
-from .config import Config, PathConfig, VocabConfig, Item2VecConfig, LSTMConfig, InferenceConfig, get_device
+from .config import Config, PathConfig, VocabConfig, Item2VecConfig, LSTMConfig, InferenceConfig, SpotifyConfig, get_device
 from .build_vocab import Vocabulary, build_vocabulary, split_playlists
 from .utils_mpd import Track, Playlist, iter_playlists, iter_mpd_slices
 from .models import Item2Vec, PlaylistLSTM
@@ -20,6 +20,7 @@ __all__ = [
     "Item2VecConfig",
     "LSTMConfig",
     "InferenceConfig",
+    "SpotifyConfig",
     "get_device",
     # Data structures
     "Track",

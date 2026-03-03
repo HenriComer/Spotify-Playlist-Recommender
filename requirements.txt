@@ -3,3 +3,4 @@ numpy
 tqdm
 faiss-cpu
 pyyaml
+spotipy>=2.23.0

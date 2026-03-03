@@ -1,5 +1,6 @@
 """Centralized configuration for Spotify Playlist Recommender."""
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -11,8 +12,8 @@ class PathConfig:
     """Paths for data and models."""
     mpd_dir: Path = Path("data/mpd")
     vocab_path: Path = Path("artifacts/vocab.json")
-    item2vec_path: Path = Path("artifacts/item2vec.pt")
-    lstm_path: Path = Path("artifacts/lstm.pt")
+    item2vec_path: Path = Path("models/item2vec.pt")
+    lstm_path: Path = Path("models/playlist_lstm.pt")
     faiss_index_path: Path = Path("artifacts/faiss.index")
     log_dir: Path = Path("logs")
     train_pids_path: Path = Path("artifacts/train_pids.json")
@@ -89,6 +90,26 @@ class InferenceConfig:
 
 
 @dataclass
+class SpotifyConfig:
+    """Spotify API configuration."""
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    redirect_uri: str = "http://127.0.0.1:8888/callback"
+    scopes: str = "user-library-read"
+    max_liked_tracks: int = 500
+    cache_dir: Path = field(default_factory=lambda: Path.home() / ".spotify-recommender")
+
+    def __post_init__(self):
+        # Fall back to environment variables if not set directly
+        if self.client_id is None:
+            self.client_id = os.environ.get("SPOTIFY_CLIENT_ID")
+        if self.client_secret is None:
+            self.client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
+        if isinstance(self.cache_dir, str):
+            self.cache_dir = Path(self.cache_dir)
+
+
+@dataclass
 class Config:
     """Master configuration combining all configs."""
     paths: PathConfig = field(default_factory=PathConfig)
@@ -96,6 +117,7 @@ class Config:
     item2vec: Item2VecConfig = field(default_factory=Item2VecConfig)
     lstm: LSTMConfig = field(default_factory=LSTMConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
+    spotify: SpotifyConfig = field(default_factory=SpotifyConfig)
     seed: int = 42
 
     @classmethod
@@ -110,6 +132,7 @@ class Config:
             item2vec=Item2VecConfig(**data.get("item2vec", {})),
             lstm=LSTMConfig(**data.get("lstm", {})),
             inference=InferenceConfig(**data.get("inference", {})),
+            spotify=SpotifyConfig(**data.get("spotify", {})),
             seed=data.get("seed", 42),
         )
 

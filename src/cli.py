@@ -320,6 +320,195 @@ def stats_command(args):
         print(f"\nSaved to {args.output}")
 
 
+def spotify_auth_command(args):
+    """Authenticate with Spotify."""
+    from .config import Config
+    from .spotify_client import SpotifyClient
+
+    # Load config
+    if args.config:
+        config = Config.from_yaml(args.config)
+    else:
+        config = Config()
+
+    client = SpotifyClient(config.spotify)
+
+    if client.is_authenticated():
+        print("Already authenticated with Spotify.")
+        user = client.get_current_user()
+        print(f"Logged in as: {user['display_name']} ({user['id']})")
+
+        if args.force:
+            print("\nRe-authenticating...")
+            client.authenticate()
+    else:
+        print("Opening browser for Spotify authentication...")
+        print(f"Redirect URI: {config.spotify.redirect_uri}")
+        print("\nIf the browser doesn't open, copy and paste the URL shown.")
+        print("-" * 50)
+
+        if client.authenticate():
+            user = client.get_current_user()
+            print(f"\nLogged in as: {user['display_name']} ({user['id']})")
+        else:
+            print("\nAuthentication failed.")
+            sys.exit(1)
+
+
+def spotify_recommend_command(args):
+    """Generate recommendations from Spotify liked tracks."""
+    from .config import Config, get_device
+    from .build_vocab import Vocabulary
+    from .train_item2vec import load_item2vec
+    from .train_seq_model import load_lstm
+    from .infer_candidates import (
+        CandidateRetriever, LSTMRanker, two_stage_recommend,
+        build_retriever_from_item2vec,
+    )
+    from .generate_playlist import generate_playlist
+    from .spotify_client import SpotifyClient
+    from .track_resolver import get_coverage_report, select_seed_tracks
+
+    # Load config
+    if args.config:
+        config = Config.from_yaml(args.config)
+    else:
+        config = Config()
+
+    device = get_device()
+
+    # Initialize Spotify client
+    client = SpotifyClient(config.spotify)
+    if not client.is_authenticated():
+        print("Not authenticated with Spotify.")
+        print("Run 'python -m src spotify-auth' first.")
+        sys.exit(1)
+
+    # Fetch liked tracks
+    print("Fetching your liked tracks from Spotify...")
+    liked_tracks = client.get_liked_tracks(limit=config.spotify.max_liked_tracks)
+    print(f"Retrieved {len(liked_tracks)} liked tracks")
+
+    if not liked_tracks:
+        print("No liked tracks found.")
+        sys.exit(1)
+
+    # Load vocabulary
+    print("\nLoading vocabulary...")
+    vocab = Vocabulary.load(config.paths.vocab_path)
+    print(f"Vocabulary size: {vocab.size}")
+
+    # Get coverage report
+    report = get_coverage_report(liked_tracks, vocab)
+
+    if args.verbose:
+        print(f"\n{report}")
+
+    # Check minimum coverage
+    if report.coverage_ratio < args.min_coverage:
+        print(f"\nWarning: Low vocabulary coverage ({report.coverage_ratio:.1%})")
+        print(f"Minimum required: {args.min_coverage:.1%}")
+        print("Your liked tracks may not overlap well with the training data.")
+        if not args.force:
+            print("Use --force to proceed anyway.")
+            sys.exit(1)
+
+    # Select seed tracks
+    seed_uris = select_seed_tracks(report, max_seeds=args.max_seeds)
+    print(f"\nUsing {len(seed_uris)} seed tracks for recommendations")
+
+    if not seed_uris:
+        print("No usable seed tracks found.")
+        sys.exit(1)
+
+    # Generate recommendations based on mode
+    print(f"\nGenerating recommendations (mode: {args.mode})...")
+    print(f"Using device: {device}")
+
+    if args.mode == "lstm":
+        # Pure LSTM generation
+        print("Loading LSTM model...")
+        lstm = load_lstm(config.paths.lstm_path, device)
+
+        recommendations = generate_playlist(
+            seed_uris=seed_uris,
+            lstm=lstm,
+            vocab=vocab,
+            num_tracks=args.num_tracks,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            device=device,
+        )
+
+    elif args.mode == "two-stage":
+        # Two-stage retrieval + ranking
+        print("Loading Item2Vec model...")
+        item2vec = load_item2vec(config.paths.item2vec_path, device)
+
+        print("Building retriever...")
+        if config.paths.faiss_index_path.exists():
+            retriever = CandidateRetriever.load(
+                config.paths.faiss_index_path,
+                item2vec.get_embeddings(),
+                nprobe=config.inference.nprobe,
+            )
+        else:
+            retriever = build_retriever_from_item2vec(
+                item2vec, config.inference, config.paths.faiss_index_path
+            )
+
+        print("Loading LSTM model...")
+        lstm = load_lstm(config.paths.lstm_path, device)
+        ranker = LSTMRanker(lstm, device)
+
+        config.inference.num_recommendations = args.num_tracks
+        recommendations = two_stage_recommend(
+            seed_uris=seed_uris,
+            retriever=retriever,
+            ranker=ranker,
+            vocab=vocab,
+            config=config.inference,
+        )
+
+    else:
+        # Item2Vec only (nearest neighbors)
+        print("Loading Item2Vec model...")
+        item2vec = load_item2vec(config.paths.item2vec_path, device)
+
+        seed_ids = vocab.encode(seed_uris)
+        seed_ids = [idx for idx in seed_ids if idx != vocab.unk_idx]
+
+        embeddings = item2vec.get_embeddings()
+        retriever = CandidateRetriever(embeddings, nprobe=config.inference.nprobe)
+        candidate_ids, scores = retriever.retrieve(seed_ids, k=args.num_tracks)
+        recommendations = vocab.decode(candidate_ids.tolist(), skip_special=True)
+
+    # Output recommendations
+    print(f"\n{'=' * 60}")
+    print(f"RECOMMENDED TRACKS ({len(recommendations)} tracks)")
+    print("=" * 60)
+
+    for i, uri in enumerate(recommendations, 1):
+        print(f"{i:3d}. {uri}")
+
+    # Save to file if requested
+    if args.output:
+        output_data = {
+            "seed_tracks": seed_uris,
+            "recommendations": recommendations,
+            "coverage_report": {
+                "total_tracks": report.total_tracks,
+                "known_tracks": report.known_tracks,
+                "unknown_tracks": report.unknown_tracks,
+                "coverage_ratio": report.coverage_ratio,
+            },
+        }
+        with open(args.output, "w") as f:
+            json.dump(output_data, f, indent=2)
+        print(f"\nSaved to {args.output}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Spotify Playlist Recommender",
@@ -374,6 +563,51 @@ def main():
     stats_parser.add_argument("--mpd-dir", required=True, help="Path to MPD directory")
     stats_parser.add_argument("--output", "-o", help="Output JSON path")
 
+    # Spotify auth command
+    spotify_auth_parser = subparsers.add_parser(
+        "spotify-auth", help="Authenticate with Spotify"
+    )
+    spotify_auth_parser.add_argument("--config", "-c", help="Path to config YAML")
+    spotify_auth_parser.add_argument(
+        "--force", "-f", action="store_true", help="Force re-authentication"
+    )
+
+    # Spotify recommend command
+    spotify_rec_parser = subparsers.add_parser(
+        "spotify-recommend", help="Generate recommendations from liked tracks"
+    )
+    spotify_rec_parser.add_argument(
+        "--num-tracks", type=int, default=50, help="Number of tracks to recommend"
+    )
+    spotify_rec_parser.add_argument(
+        "--max-seeds", type=int, default=100, help="Maximum liked tracks to use as seeds"
+    )
+    spotify_rec_parser.add_argument(
+        "--min-coverage", type=float, default=0.1,
+        help="Minimum vocabulary coverage ratio to proceed"
+    )
+    spotify_rec_parser.add_argument(
+        "--mode", choices=["lstm", "two-stage", "item2vec"], default="two-stage",
+        help="Recommendation mode"
+    )
+    spotify_rec_parser.add_argument("--config", "-c", help="Path to config YAML")
+    spotify_rec_parser.add_argument(
+        "--temperature", type=float, default=1.0, help="Sampling temperature"
+    )
+    spotify_rec_parser.add_argument(
+        "--top-k", type=int, default=50, help="Top-k filtering"
+    )
+    spotify_rec_parser.add_argument(
+        "--top-p", type=float, default=0.9, help="Nucleus sampling threshold"
+    )
+    spotify_rec_parser.add_argument("--output", "-o", help="Output JSON path")
+    spotify_rec_parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Show coverage report"
+    )
+    spotify_rec_parser.add_argument(
+        "--force", action="store_true", help="Proceed even with low coverage"
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -388,6 +622,8 @@ def main():
         "recommend": recommend_command,
         "evaluate": evaluate_command,
         "stats": stats_command,
+        "spotify-auth": spotify_auth_command,
+        "spotify-recommend": spotify_recommend_command,
     }
 
     commands[args.command](args)
